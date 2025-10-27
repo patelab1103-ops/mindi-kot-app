@@ -1,350 +1,324 @@
+// App.tsx
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-  View,
+  Alert,
+  SafeAreaView,
+  StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
+  View,
   FlatList,
-  Alert,
-  ActivityIndicator,
-  StyleSheet,
-  SafeAreaView,
-  StatusBar,
 } from 'react-native';
-import { auth, db, ensureAnon } from './src/firebase';
-import { useRoom, Player } from './src/store/roomStore';
+import { router } from 'expo-router';
+
+import { auth, db } from './src/firebase';
+import {
+  signInAnonymously,
+  onAuthStateChanged,
+} from 'firebase/auth';
 import {
   addDoc,
   collection,
+  deleteDoc,
   doc,
-  getDocs,
+  getDoc,
   onSnapshot,
+  orderBy,
   query,
   serverTimestamp,
   setDoc,
-  where,
+  updateDoc,
 } from 'firebase/firestore';
 
-function makeCode() {
-  return Math.random().toString(36).slice(2, 8).toUpperCase();
-}
+type PlayerRow = {
+  uid: string;
+  displayName: string;
+  seat: number;     // 0..N-1
+  team: 'A' | 'B' | 'C' | 'D';
+  isHost?: boolean;
+};
 
-/** Reusable black button with grey outline */
-function AppButton({
-  title,
-  onPress,
-  disabled,
-}: {
-  title: string;
-  onPress: () => void;
-  disabled?: boolean;
-}) {
-  return (
-    <TouchableOpacity
-      activeOpacity={0.8}
-      onPress={onPress}
-      disabled={disabled}
-      style={[styles.button, disabled && styles.buttonDisabled]}
-    >
-      <Text style={styles.buttonText}>{title}</Text>
-    </TouchableOpacity>
-  );
+// 3-letter room codes
+function makeCode() {
+  let out = '';
+  const A = 'A'.charCodeAt(0);
+  for (let i = 0; i < 3; i++) out += String.fromCharCode(A + Math.floor(Math.random() * 26));
+  return out;
 }
 
 export default function App() {
-  const { name, setName, setUid, roomId, code, setRoom, players, setPlayers } = useRoom();
-  const [joinCode, setJoinCode] = useState('');
-  const [phase, setPhase] = useState<'home' | 'lobby'>('home');
-  const [loading, setLoading] = useState(true);
+  // auth
+  const [uid, setUid] = useState<string | null>(null);
 
-  // Sign in anonymously, fail loudly if anything breaks
+  // UI state
+  const [screen, setScreen] = useState<'home' | 'lobby'>('home');
+
+  // inputs
+  const [name, setName] = useState('');
+  const [joinCode, setJoinCode] = useState('');
+
+  // room
+  const [roomId, setRoomId] = useState<string | null>(null);
+  const [players, setPlayers] = useState<PlayerRow[]>([]);
+
+  // ---------- auth ----------
   useEffect(() => {
-    (async () => {
-      try {
-        await ensureAnon();
-        if (auth.currentUser?.uid) setUid(auth.currentUser.uid);
-      } catch (e: any) {
-        console.error('Auth error:', e);
-        Alert.alert('Sign-in failed', String(e?.message || e));
-      } finally {
-        setLoading(false);
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      if (u) {
+        setUid(u.uid);
+      } else {
+        const cred = await signInAnonymously(auth);
+        setUid(cred.user.uid);
       }
-    })();
+    });
+    return () => unsub();
   }, []);
 
-  function listenPlayers(id: string) {
-    return onSnapshot(
-      collection(db, `rooms/${id}/players`),
-      (ps) => {
-        const arr: Player[] = ps.docs.map((d) => ({ uid: d.id, ...(d.data() as any) }));
-        arr.sort((a, b) => a.seat - b.seat);
-        setPlayers(arr);
-      },
-      (err) => {
-        console.error('Players listen error:', err);
-        Alert.alert('Realtime error', String(err?.message || err));
-      }
-    );
-  }
+  // ---------- subscribe players in current room ----------
+  useEffect(() => {
+    if (!roomId) return;
+    const q = query(collection(db, `rooms/${roomId}/players`), orderBy('seat', 'asc'));
+    const unsub = onSnapshot(q, (snap) => {
+      const arr: PlayerRow[] = [];
+      snap.forEach((d) => arr.push(d.data() as PlayerRow));
+      setPlayers(arr);
+    });
+    return () => unsub();
+  }, [roomId]);
 
+  const meInRoom = useMemo(() => players.find((p) => p.uid === uid), [players, uid]);
+  const amHost = useMemo(() => !!players.find((p) => p.isHost && p.uid === uid), [players, uid]);
+
+  // ---------- room actions ----------
   async function createRoom() {
-    try {
-      if (!name.trim()) return Alert.alert('Enter your name');
-      const roomCode = makeCode();
-      const ref = await addDoc(collection(db, 'rooms'), {
-        code: roomCode,
-        game: 'mindi',
-        teamMode: 'two_teams',
-        status: 'lobby',
-        createdAt: serverTimestamp(),
-      });
-
-      const uid = auth.currentUser!.uid;
-      await setDoc(doc(db, `rooms/${ref.id}/players/${uid}`), {
-        displayName: name.trim(),
-        seat: 0,
-        team: 'A',
-        isHost: true,
-        connected: true,
-      });
-
-      setRoom(ref.id, roomCode);
-      setPhase('lobby');
-      listenPlayers(ref.id);
-    } catch (e: any) {
-      console.error('Create room failed:', e);
-      Alert.alert('Create room failed', String(e?.message || e));
+    if (!name.trim()) {
+      Alert.alert('Enter your name first');
+      return;
     }
+    const code = makeCode();
+    const roomRef = doc(db, 'rooms', code);
+    const exists = await getDoc(roomRef);
+    if (exists.exists()) {
+      // extremely unlikely; regenerate
+      return createRoom();
+    }
+    await setDoc(roomRef, {
+      createdAt: serverTimestamp(),
+      code,
+    });
+    setRoomId(code);
+    setScreen('lobby');
   }
 
-  async function joinByCode() {
-    try {
-      if (!name.trim()) return Alert.alert('Enter your name');
-      const codeUpper = joinCode.trim().toUpperCase();
-      if (!codeUpper) return Alert.alert('Enter a room code');
-      const q = query(collection(db, 'rooms'), where('code', '==', codeUpper));
-      const snap = await getDocs(q);
-      if (snap.empty) return Alert.alert('No room found with that code');
-
-      const roomDoc = snap.docs[0];
-      const id = roomDoc.id;
-      setRoom(id, codeUpper);
-      setPhase('lobby');
-      listenPlayers(id);
-    } catch (e: any) {
-      console.error('Join failed:', e);
-      Alert.alert('Join failed', String(e?.message || e));
+  async function joinRoom() {
+    if (!name.trim()) {
+      Alert.alert('Enter your name first');
+      return;
     }
+    const code = (joinCode || '').trim().toUpperCase();
+    if (!code || code.length !== 3) {
+      Alert.alert('Enter a 3-letter room code');
+      return;
+    }
+    const roomRef = doc(db, 'rooms', code);
+    const exists = await getDoc(roomRef);
+    if (!exists.exists()) {
+      Alert.alert('Room not found');
+      return;
+    }
+    setRoomId(code);
+    setScreen('lobby');
   }
-
-  const nextSeatAndTeam = useMemo(() => {
-    const taken = new Set(players.map((p) => p.seat));
-    let seat = 0;
-    while (taken.has(seat)) seat++;
-    const team: 'A' | 'B' = seat % 2 === 0 ? 'A' : 'B';
-    return { seat, team };
-  }, [players]);
 
   async function claimSeat() {
-    try {
-      if (!roomId) return;
-      const uid = auth.currentUser!.uid;
-      const me = players.find((p) => p.uid === uid);
-      if (me) return Alert.alert('Seat already claimed');
-
-      await setDoc(doc(db, `rooms/${roomId}/players/${uid}`), {
-        displayName: name.trim() || 'You',
-        seat: nextSeatAndTeam.seat,
-        team: nextSeatAndTeam.team,
-        isHost: players.length === 0,
-        connected: true,
-      });
-    } catch (e: any) {
-      console.error('Claim seat failed:', e);
-      Alert.alert('Claim seat failed', String(e?.message || e));
+    if (!roomId || !uid) return;
+    if (!name.trim()) {
+      Alert.alert('Enter your name'); return;
     }
+    if (meInRoom) {
+      Alert.alert('You already have a seat'); return;
+    }
+    // seat index = first free index in order
+    const takenSeats = new Set(players.map((p) => p.seat));
+    let seat = 0;
+    while (takenSeats.has(seat)) seat++;
+    // team: ABAB…
+    const team = seat % 2 === 0 ? 'A' : 'B';
+    // host = first claimer
+    const hostAlready = players.some((p) => p.isHost);
+    const isHost = hostAlready ? false : true;
+
+    await setDoc(doc(db, `rooms/${roomId}/players/${uid}`), {
+      uid,
+      displayName: name.trim(),
+      seat,
+      team,
+      isHost,
+      joinedAt: serverTimestamp(),
+    } as PlayerRow);
   }
 
-  if (loading) {
+  async function leaveSeat() {
+    if (!roomId || !uid) return;
+    try {
+      await deleteDoc(doc(db, `rooms/${roomId}/players/${uid}`));
+    } catch {}
+  }
+
+  // Host → proceed to Setup (writes seats/teamMap/hostUid first)
+  async function continueToSetup() {
+    if (!roomId) return;
+    if (!amHost) {
+      Alert.alert('Only host can start'); return;
+    }
+    const ordered = players.slice().sort((a, b) => a.seat - b.seat);
+    const seats = ordered.map((p) => p.uid);
+    const teamMap = ordered.map((p) => p.team);
+    const hostUid = ordered.find((p) => p.isHost)?.uid || seats[0];
+
+    await updateDoc(doc(db, 'rooms', roomId), {
+      seats,
+      teamMap,
+      hostUid,
+    });
+
+    router.push('/setup');
+  }
+
+  // ---------- UI ----------
+  if (!uid) {
     return (
-      <SafeAreaView style={styles.container}>
-        <StatusBar barStyle="dark-content" />
-        <View style={styles.center}>
-          <ActivityIndicator />
-          <Text style={styles.muted}>Starting…</Text>
-        </View>
+      <SafeAreaView style={[S.container, { alignItems: 'center', justifyContent: 'center' }]}>
+        <Text style={{ color: '#111' }}>Connecting…</Text>
       </SafeAreaView>
     );
   }
 
-  if (phase === 'home') {
+  if (screen === 'home') {
     return (
-      <SafeAreaView style={styles.container}>
-        <StatusBar barStyle="dark-content" />
-        <View style={styles.header}>
-          <Text style={styles.title}>Mindi Kot — Lobby</Text>
-          <Text style={styles.subtitle}>Create a room or join one with a code</Text>
-        </View>
+      <SafeAreaView style={S.container}>
+        <Text style={S.title}>Mindi Kot</Text>
 
-        <View style={styles.section}>
-          <Text style={styles.label}>Your Name</Text>
-          <TextInput
-            value={name}
-            onChangeText={setName}
-            placeholder="e.g., Adi"
-            placeholderTextColor={colors.muted}
-            autoCapitalize="words"
-            style={styles.input}
-          />
-          <AppButton title="Create Room" onPress={createRoom} />
-        </View>
+        <Text style={S.label}>Your name</Text>
+        <TextInput
+          value={name}
+          onChangeText={setName}
+          placeholder="Enter your name"
+          placeholderTextColor="#9ca3af"
+          style={S.input}
+        />
 
-        <View style={styles.divider} />
+        <TouchableOpacity onPress={createRoom} style={S.btn}>
+          <Text style={S.btnTxt}>Create Room</Text>
+        </TouchableOpacity>
 
-        <View style={styles.section}>
-          <Text style={styles.label}>Room Code</Text>
-          <TextInput
-            value={joinCode}
-            onChangeText={setJoinCode}
-            placeholder="ABC123"
-            placeholderTextColor={colors.muted}
-            autoCapitalize="characters"
-            style={styles.input}
-          />
-          <AppButton title="Join by Code" onPress={joinByCode} />
-        </View>
+        <View style={{ height: 14 }} />
+
+        <Text style={S.label}>Join by code</Text>
+        <TextInput
+          value={joinCode}
+          onChangeText={(t) => setJoinCode(t.toUpperCase())}
+          placeholder="ABC"
+          placeholderTextColor="#9ca3af"
+          autoCapitalize="characters"
+          maxLength={3}
+          style={S.input}
+        />
+
+        <TouchableOpacity onPress={joinRoom} style={S.btn}>
+          <Text style={S.btnTxt}>Join Room</Text>
+        </TouchableOpacity>
       </SafeAreaView>
     );
   }
 
-  // LOBBY
+  // Lobby
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="dark-content" />
-      <View style={styles.headerRow}>
-        <Text style={styles.title}>Lobby</Text>
-        {code ? (
-          <Text style={styles.code}>
-            Room: <Text style={styles.codeBold}>{code}</Text>
-          </Text>
-        ) : null}
+    <SafeAreaView style={S.container}>
+      <Text style={S.title}>Lobby</Text>
+      <Text style={S.sub}>Room: <Text style={{ fontWeight: '800' }}>{roomId}</Text></Text>
+
+      <View style={{ marginTop: 10 }}>
+        {players
+          .slice()
+          .sort((a, b) => a.seat - b.seat)
+          .map((p, i) => (
+            <Text key={p.uid} style={S.row}>
+              {i + 1}. {p.displayName} — Team {p.team}
+              {p.isHost ? ' (Host)' : ''}
+            </Text>
+          ))}
       </View>
 
-      <FlatList
-        style={{ marginTop: 12 }}
-        data={[...players]}
-        keyExtractor={(x) => x.uid}
-        renderItem={({ item }) => (
-          <Text style={styles.listItem}>
-            {item.seat + 1}. {item.displayName} — Team {item.team}
-            {item.isHost ? ' (Host)' : ''}
-          </Text>
-        )}
-        ListEmptyComponent={
-          <Text style={styles.muted}>No players yet. Tap “Claim Seat”.</Text>
-        }
-      />
+      {!meInRoom ? (
+        <TouchableOpacity onPress={claimSeat} style={[S.btn, { marginTop: 'auto' }]}>
+          <Text style={S.btnTxt}>Claim Seat</Text>
+        </TouchableOpacity>
+      ) : (
+        <View style={{ marginTop: 'auto' }}>
+          <TouchableOpacity onPress={leaveSeat} style={[S.btnGhost]}>
+            <Text style={S.btnGhostTxt}>Leave Seat</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
-      <View style={{ height: 12 }} />
-      <AppButton title="Claim Seat" onPress={claimSeat} />
+      {/* Start button visible to everyone; only host can actually start */}
+<TouchableOpacity
+  onPress={continueToSetup}
+  style={[
+    S.btn,
+    { marginTop: 10, opacity: amHost ? 1 : 0.6 }
+  ]}
+>
+  <Text style={S.btnTxt}>
+    {amHost ? 'Setup & Start' : 'Setup & Start (Host only)'}
+  </Text>
+</TouchableOpacity>
 
-      <Text style={[styles.muted, { marginTop: 18 }]}>Next: deal & play.</Text>
+{/* Show who the host is so people know who should press it */}
+<Text style={{ color: '#6b7280', marginTop: 6 }}>
+  Host: {players.find(p => p.isHost)?.displayName || '—'}
+</Text>
+
+
+      <Text style={{ color: '#6b7280', marginTop: 10 }}>Next: deal & play.</Text>
     </SafeAreaView>
   );
 }
 
-/* ---------------------------- THEME & STYLES ---------------------------- */
-
-const colors = {
-  bg: '#FFFFFF',          // white background
-  text: '#111827',        // near-black text
-  border: '#D1D5DB',      // light grey borders
-  outline: '#9CA3AF',     // mid grey outline
-  buttonBg: '#000000',    // black button background
-  buttonText: '#FFFFFF',  // white button text
-  muted: '#6B7280',       // muted grey text
-};
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: colors.bg,
-    paddingHorizontal: 20,
-    paddingTop: 12,
-  },
-  center: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  header: {
-    marginVertical: 12,
-  },
-  headerRow: {
-    marginVertical: 12,
-  },
-  title: {
-    color: colors.text,
-    fontSize: 22,
-    fontWeight: '800',
-  },
-  subtitle: {
-    color: colors.muted,
-    marginTop: 4,
-  },
-  code: {
-    color: colors.text,
-    marginTop: 4,
-  },
-  codeBold: {
-    color: colors.text,
-    fontWeight: '800',
-    letterSpacing: 0.5,
-  },
-  section: {
-    gap: 10,
-    marginTop: 8,
-  },
-  label: {
-    color: colors.text,
-    fontWeight: '600',
-  },
+const S = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#fff', padding: 16 },
+  title: { fontSize: 22, fontWeight: '800', color: '#111' },
+  sub: { marginTop: 4, color: '#111' },
+  label: { marginTop: 16, marginBottom: 6, color: '#111', fontWeight: '700' },
   input: {
+    backgroundColor: '#fff',
+    color: '#111',
     borderWidth: 1,
-    borderColor: colors.border,
-    color: colors.text,
+    borderColor: '#d1d5db',
+    borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    borderRadius: 8,
-    backgroundColor: '#FFFFFF',
   },
-  button: {
-    backgroundColor: colors.buttonBg,
-    borderColor: colors.outline,
+  btn: {
+    marginTop: 12,
+    backgroundColor: '#000',
+    borderColor: '#9ca3af',
     borderWidth: 1,
     paddingVertical: 12,
     borderRadius: 10,
     alignItems: 'center',
   },
-  buttonDisabled: {
-    opacity: 0.6,
+  btnTxt: { color: '#fff', fontWeight: '700' },
+  btnGhost: {
+    backgroundColor: '#fff',
+    borderColor: '#d1d5db',
+    borderWidth: 1,
+    paddingVertical: 10,
+    borderRadius: 10,
+    alignItems: 'center',
   },
-  buttonText: {
-    color: colors.buttonText,
-    fontWeight: '700',
-    fontSize: 16,
-    letterSpacing: 0.2,
-  },
-  divider: {
-    height: 1,
-    backgroundColor: colors.border,
-    marginVertical: 16,
-  },
-  listItem: {
-    color: colors.text,
-    paddingVertical: 6,
-  },
-  muted: {
-    color: colors.muted,
-  },
+  btnGhostTxt: { color: '#111', fontWeight: '700' },
+  row: { color: '#111', marginVertical: 4 },
 });
