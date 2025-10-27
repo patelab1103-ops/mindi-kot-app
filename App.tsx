@@ -8,17 +8,12 @@ import {
   TextInput,
   TouchableOpacity,
   View,
-  FlatList,
 } from 'react-native';
 import { router } from 'expo-router';
 
 import { auth, db } from './src/firebase';
+import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import {
-  signInAnonymously,
-  onAuthStateChanged,
-} from 'firebase/auth';
-import {
-  addDoc,
   collection,
   deleteDoc,
   doc,
@@ -34,9 +29,10 @@ import {
 type PlayerRow = {
   uid: string;
   displayName: string;
-  seat: number;     // 0..N-1
+  seat: number; // 0..N-1
   team: 'A' | 'B' | 'C' | 'D';
   isHost?: boolean;
+  joinedAt?: any;
 };
 
 // 3-letter room codes
@@ -88,7 +84,8 @@ export default function App() {
   }, [roomId]);
 
   const meInRoom = useMemo(() => players.find((p) => p.uid === uid), [players, uid]);
-  const amHost = useMemo(() => !!players.find((p) => p.isHost && p.uid === uid), [players, uid]);
+  const hostRow = useMemo(() => players.find((p) => p.isHost), [players]);
+  const amHost = useMemo(() => hostRow?.uid === uid, [hostRow?.uid, uid]);
 
   // ---------- room actions ----------
   async function createRoom() {
@@ -166,24 +163,31 @@ export default function App() {
     } catch {}
   }
 
-  // Host → proceed to Setup (writes seats/teamMap/hostUid first)
+  // Host → proceed to Setup (ALWAYS navigates; writes seats/teamMap/hostUid first with try/catch)
   async function continueToSetup() {
     if (!roomId) return;
-    if (!amHost) {
-      Alert.alert('Only host can start'); return;
+
+    // Let anyone press; the Setup page does the actual start.
+    // We still *attempt* to write seats/team/host so Game can initialize.
+    try {
+      const ordered = players.slice().sort((a, b) => a.seat - b.seat);
+      const seats = ordered.map((p) => p.uid);
+      const teamMap = ordered.map((p) => p.team);
+      const hostUid = ordered.find((p) => p.isHost)?.uid || seats[0];
+
+      await updateDoc(doc(db, 'rooms', roomId), {
+        seats,
+        teamMap,
+        hostUid,
+      });
+    } catch (e: any) {
+      // Don’t block navigation — just inform
+      console.log('continueToSetup write failed', e?.message || e);
+      Alert.alert('Note', 'Could not save seats to server yet, continuing to Setup anyway.');
     }
-    const ordered = players.slice().sort((a, b) => a.seat - b.seat);
-    const seats = ordered.map((p) => p.uid);
-    const teamMap = ordered.map((p) => p.team);
-    const hostUid = ordered.find((p) => p.isHost)?.uid || seats[0];
 
-    await updateDoc(doc(db, 'rooms', roomId), {
-      seats,
-      teamMap,
-      hostUid,
-    });
-
-    router.push('/setup');
+    // Navigate no matter what — so you’re never stuck on Lobby
+    router.replace('/setup');
   }
 
   // ---------- UI ----------
@@ -237,7 +241,9 @@ export default function App() {
   return (
     <SafeAreaView style={S.container}>
       <Text style={S.title}>Lobby</Text>
-      <Text style={S.sub}>Room: <Text style={{ fontWeight: '800' }}>{roomId}</Text></Text>
+      <Text style={S.sub}>
+        Room: <Text style={{ fontWeight: '800' }}>{roomId}</Text>
+      </Text>
 
       <View style={{ marginTop: 10 }}>
         {players
@@ -263,24 +269,19 @@ export default function App() {
         </View>
       )}
 
-      {/* Start button visible to everyone; only host can actually start */}
-<TouchableOpacity
-  onPress={continueToSetup}
-  style={[
-    S.btn,
-    { marginTop: 10, opacity: amHost ? 1 : 0.6 }
-  ]}
->
-  <Text style={S.btnTxt}>
-    {amHost ? 'Setup & Start' : 'Setup & Start (Host only)'}
-  </Text>
-</TouchableOpacity>
+      {/* Start button visible to everyone; we still allow navigation so no one gets stuck */}
+      <TouchableOpacity
+        onPress={continueToSetup}
+        style={[S.btn, { marginTop: 10, opacity: amHost ? 1 : 0.85 }]}
+      >
+        <Text style={S.btnTxt}>
+          {amHost ? 'Setup & Start' : 'Setup & Start (Host only proceeds)'}
+        </Text>
+      </TouchableOpacity>
 
-{/* Show who the host is so people know who should press it */}
-<Text style={{ color: '#6b7280', marginTop: 6 }}>
-  Host: {players.find(p => p.isHost)?.displayName || '—'}
-</Text>
-
+      <Text style={{ color: '#6b7280', marginTop: 6 }}>
+        Host: {hostRow?.displayName || '—'}
+      </Text>
 
       <Text style={{ color: '#6b7280', marginTop: 10 }}>Next: deal & play.</Text>
     </SafeAreaView>
