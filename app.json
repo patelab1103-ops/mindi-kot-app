@@ -1,12 +1,12 @@
 {
   "expo": {
-    "name": "mindi-kot-app",
-    "slug": "mindi-kot-app",
+    "name": "Mindi Kot",
+    "slug": "mindi-kot",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
+    "scheme": "mindikot",
+    "icon": "./assets/icon.png",
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -19,12 +19,19 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
-      },
-      "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      }
     },
     "web": {
-      "favicon": "./assets/favicon.png"
-    }
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/favicon.png",
+      "themeColor": "#111827",
+      "backgroundColor": "#ffffff",
+      "display": "standalone",
+      "startUrl": "."
+    },
+    "plugins": [
+      "expo-router"
+    ]
   }
 }
